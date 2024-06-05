@@ -1,24 +1,27 @@
 extern crate pnet;
 
+use std::collections::HashMap;
+use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::thread;
 use std::time::Duration;
 
-use clap::{CommandFactory, Parser};
+use clap::Parser;
 use pnet::packet::icmp::time_exceeded::TimeExceededPacket;
-use pnet::packet::icmp::{Icmp, IcmpPacket};
+use pnet::packet::icmp::IcmpPacket;
 use pnet::packet::icmpv6::Icmpv6Packet;
-use pnet::packet::ip::IpNextHeaderProtocols;
-use pnet::packet::ipv4::{Ipv4Packet, MutableIpv4Packet};
-use pnet::packet::{ethernet, FromPacket, MutablePacket, Packet, PacketData};
-use pnet::transport::TransportChannelType::{Layer3, Layer4};
+use pnet::packet::ip::IpNextHeaderProtocols::{self, Test1};
+use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::Packet;
+use pnet::transport::transport_channel;
+use pnet::transport::TransportChannelType::Layer4;
 use pnet::transport::TransportProtocol::{Ipv4, Ipv6};
 use pnet::transport::{
     icmp_packet_iter, icmpv6_packet_iter, Ecn, IcmpTransportChannelIterator,
     Icmpv6TransportChannelIterator,
 };
-use pnet::transport::{ipv4_packet_iter, transport_channel};
-use pnet::util::MacAddr;
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Serializer;
 
 #[derive(Debug, Clone)]
 enum Target {
@@ -27,10 +30,62 @@ enum Target {
     Name(String),
 }
 
+#[derive(Serialize, Debug, Clone, PartialEq)]
+struct Hop {
+    pub index: u8,
+    pub address: IpAddr,
+    pub diverges: bool,
+    pub detected_bleeching: bool,
+}
+
+impl Hop {
+    fn new(index: u8, addr: IpAddr, bleeching: bool) -> Self {
+        Self {
+            index,
+            address: addr,
+            diverges: false,
+            detected_bleeching: bleeching,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct EcnWrapper {
+    pub ecn: Ecn,
+}
+
+impl Serialize for EcnWrapper {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let actual_value = self.ecn as u8;
+        serializer.serialize_u8(actual_value)
+    }
+}
+
+impl<'de> Deserialize<'de> for EcnWrapper {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = u8::deserialize(deserializer)?;
+        let ecn = Ecn::from(raw);
+        Ok(EcnWrapper { ecn })
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Mode {
     Ipv6,
     Ipv4,
+}
+
+#[derive(Serialize)]
+struct TestResult {
+    #[serde(flatten)]
+    pub path: Path,
+    pub bleeched_hop: Option<Hop>,
 }
 
 fn parse_target(arg: &str) -> Result<Target, String> {
@@ -43,30 +98,118 @@ fn parse_target(arg: &str) -> Result<Target, String> {
     }
 }
 
+fn ecn_to_string(ecn: Ecn) -> String {
+    match ecn {
+        Ecn::CE => "Congestion experienced".to_string(),
+        Ecn::Ect0 => "ECT(0)".to_string(),
+        Ecn::Ect1 => "ECT(1)".to_string(),
+        Ecn::NotEct => "ECT disabled".to_string(),
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
     /// Where to send IP packets.
     #[arg(short, value_parser = parse_target)]
     target: Target,
+
+    #[arg(short, long, action = clap::ArgAction::Count)]
+    debug: u8,
+
+    /// Print the discovered path.
+    #[arg(short, long, default_value_t = false)]
+    path: bool,
 }
 
-struct EmptyPacket {
-    buffer: [u8; 400],
+struct EmptyPacket<'p> {
+    buffer: &'p [u8],
 }
 
-impl Packet for EmptyPacket {
+impl<'p> Packet for EmptyPacket<'p> {
     fn packet(&self) -> &[u8] {
-        &self.buffer
+        self.buffer
     }
 
     fn payload(&self) -> &[u8] {
-        &self.buffer
+        self.buffer
+    }
+}
+
+#[derive(Serialize)]
+struct Path {
+    path: HashMap<u8, Hop>,
+}
+
+impl Path {
+    fn new() -> Self {
+        Path {
+            path: HashMap::new(),
+        }
+    }
+
+    fn update_hop(&mut self, hop_no: u8, hop: Hop) -> bool {
+        match self.path.get_mut(&hop_no) {
+            Some(existing_hop) => {
+                existing_hop.diverges = existing_hop.address != hop.address;
+                existing_hop.detected_bleeching |= hop.detected_bleeching;
+                existing_hop.diverges
+            }
+            None => {
+                self.path.insert(hop_no, hop);
+                false
+            }
+        }
+    }
+
+    fn bleeched_hop(&self) -> Option<Hop> {
+        let mut hops: Vec<&u8> = self.path.keys().collect();
+        let mut prev_hop: Option<Hop> = None;
+        hops.sort();
+        for hop_no in hops {
+            if self.path.get(hop_no).unwrap().detected_bleeching {
+                if let Some(prev_hop) = prev_hop {
+                    return Some(prev_hop);
+                } else {
+                    return Some(Hop {
+                        index: 0u8,
+                        address: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                        diverges: false,
+                        detected_bleeching: true,
+                    });
+                }
+            }
+            prev_hop = Some(self.path.get(hop_no).unwrap().clone());
+        }
+        None
+    }
+}
+
+impl fmt::Display for Path {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let default_hop = Hop {
+            index: 0,
+            address: IpAddr::V4(Ipv4Addr::BROADCAST),
+            diverges: false,
+            detected_bleeching: false,
+        };
+        let mut hops: Vec<&u8> = self.path.keys().collect();
+        hops.sort();
+        for hop in hops {
+            write!(
+                f,
+                "{}: {:?}\n",
+                hop,
+                self.path.get(&hop).unwrap_or(&default_hop.clone())
+            )?;
+        }
+        Ok(())
     }
 }
 
 enum VersionedIcmpPacket<'a> {
     Ipv4(IcmpPacket<'a>),
+    #[allow(dead_code)]
     Ipv6(Icmpv6Packet<'a>),
 }
 
@@ -99,6 +242,9 @@ impl<'a> IcmpIterable<'a> {
 fn main() {
     let args = Args::parse();
 
+    //let mut path: HashMap<u8, Hop> = HashMap::new();
+    let mut path = Path::new();
+
     let (target, mode) = match args.target.clone() {
         Target::Name(name) => {
             let hostname_with_dummy_port = name.clone() + ":80";
@@ -115,7 +261,7 @@ fn main() {
 
             let resolution_result_count = sv.len();
             let server_ip = sv[0];
-            if sv.len() > 1 {
+            if resolution_result_count > 1 {
                 println!(
                     "Warning: There were multiple IP addresses resolved from {:?}; using {:?}",
                     name.clone(),
@@ -132,17 +278,31 @@ fn main() {
     };
 
     let protocol = match mode {
-        Mode::Ipv4 => Layer4(Ipv4(IpNextHeaderProtocols::Test1)),
+        Mode::Ipv4 => {
+            if args.debug > 1 {
+                println!("Matching mode v4 to set protocol!");
+            }
+            Layer4(Ipv4(IpNextHeaderProtocols::Test1))
+        }
         Mode::Ipv6 => {
-            println!("Mode v6!");
+            if args.debug > 1 {
+                println!("Matching mode v6 to set protocol!");
+            }
             Layer4(Ipv6(IpNextHeaderProtocols::Test1))
         }
     };
     let icmp_protocol = match mode {
-        Mode::Ipv4 => Layer4(Ipv4(IpNextHeaderProtocols::Icmp)),
+        Mode::Ipv4 => {
+            if args.debug > 1 {
+                println!("Matching mode v4 to set ICMP protocol!");
+            }
+            Layer4(Ipv4(IpNextHeaderProtocols::Icmp))
+        }
         Mode::Ipv6 => {
-            println!("Mode v6!");
-            Layer4(Ipv6((IpNextHeaderProtocols::Icmpv6)))
+            if args.debug > 1 {
+                println!("Matching mode v6 to set ICMP protocol!");
+            }
+            Layer4(Ipv6(IpNextHeaderProtocols::Icmpv6))
         }
     };
 
@@ -168,51 +328,227 @@ fn main() {
         }
     };
 
-    let mut ttl = 1;
+    let mut ttl: u8 = 1;
+    let mut probe_count: u8 = 1;
 
     let mut icmp_rx_iter = match mode {
         Mode::Ipv4 => IcmpIterable::Ipv4(icmp_packet_iter(&mut icmp_rx)),
         Mode::Ipv6 => IcmpIterable::Ipv6(icmpv6_packet_iter(&mut icmp_rx)),
     };
 
+    let mut consecutive_timeouts = 0u32;
     loop {
-        let buffer = [0xff as u8; 400];
-        let maybe_packet = EmptyPacket { buffer };
+        /*
+        let probe = Probe{ttl: ttl, ecn: EcnWrapper{ecn:Ecn::Ect0}};
+        let json_probe = serde_json::to_string(&probe).unwrap();
+        let json_probe_buffer = json_probe.as_bytes();
+        */
 
-        tx.set_ecn(Ecn::Ect0);
-        tx.set_ttl(ttl);
+        let confirmation_count = 3u32;
 
-        tx.send_to(maybe_packet, target);
+        // Send out _confirmation_count_ packets per TTL.
 
-        if let Some((rcvd_icmp_packet, rcvd_icmp_addr)) =
-            icmp_rx_iter.next_with_timeout(Duration::from_secs(2))
-        {
-            println!("Got a packet back from {:?}", rcvd_icmp_addr);
-            match rcvd_icmp_packet {
-                VersionedIcmpPacket::Ipv4(pkt) => {
-                    println!("ICMP code: {:?}", pkt.get_icmp_code());
-                    println!("ICMP type: {:?}", pkt.get_icmp_type());
-                    if let Some(timeout_pkt) = TimeExceededPacket::new(pkt.packet()) {
-                        println!("timeout pkt: {:?}", timeout_pkt.get_icmp_type());
-                        if let Some(inner_pkt) = Ipv4Packet::new(timeout_pkt.payload()) {
-                            println!(
-                                "Received Protocol: {:?}",
-                                inner_pkt.get_next_level_protocol()
-                            );
-                            println!("Received ECN: {:?}", inner_pkt.get_ecn());
-                        } else {
-                            println!("Trouble!")
+        let mut outstanding_probes = 0u32;
+
+        for attempt_no in 0..confirmation_count {
+            let probed_ecn = if rand::random() { Ecn::Ect1 } else { Ecn::Ect0 };
+            let probe = [probe_count, ttl, probed_ecn as u8];
+
+            let maybe_packet = EmptyPacket { buffer: &probe };
+
+            if let Err(err) = tx.set_ecn(probed_ecn) {
+                println!(
+                    "Failed to set the ECN bit for the sender (Error: {:?}). Will retry later!",
+                    err
+                );
+                continue;
+            }
+            if let Err(err) = tx.set_ttl(ttl) {
+                println!(
+                    "Failed to set the TTL for the sender (Error: {:?}). Will retry later!",
+                    err
+                );
+                continue;
+            }
+            if let Err(err) = tx.send_to(maybe_packet, target) {
+                println!(
+                    "Failed to send the packet (Error: {:?}). Will retry later!",
+                    err
+                );
+                continue;
+            }
+
+            outstanding_probes += 1;
+
+            println!("Sent out the {}th probe for TTL {}.", attempt_no, ttl);
+            println!(
+                "There are {} outstanding probes for this TTL.",
+                outstanding_probes
+            );
+            println!("There are {} consecutive timeouts.", consecutive_timeouts);
+
+            loop {
+                let read_result = icmp_rx_iter.next_with_timeout(Duration::from_secs(2));
+                if let Some((rcvd_icmp_packet, rcvd_icmp_addr)) = read_result {
+                    match rcvd_icmp_packet {
+                        VersionedIcmpPacket::Ipv4(pkt) => {
+                            if let Some(timeout_pkt) = TimeExceededPacket::new(pkt.packet()) {
+                                if let Some(inner_pkt) = Ipv4Packet::new(timeout_pkt.payload()) {
+                                    // Get the data from inside the packet that is reflected back.
+                                    let probe_count = inner_pkt.payload()[0];
+
+                                    let expected_ttl = inner_pkt.payload()[1];
+                                    let expected_ecn_raw = inner_pkt.payload()[2];
+                                    let expected_ecn: Ecn = Ecn::from(expected_ecn_raw);
+
+                                    // Get the data about the packet that is reflected back.
+                                    let actual_ecn = Ecn::from(inner_pkt.get_ecn());
+                                    let actual_protocol = inner_pkt.get_next_level_protocol();
+                                    let actual_ttl = inner_pkt.get_ttl();
+
+                                    // It's possible that we received a non-test packet back. Let's reject it.
+                                    if actual_protocol != Test1 {
+                                        if args.debug > 1 {
+                                            println!("Discarding a non test packet.")
+                                        }
+                                        continue;
+                                    }
+
+                                    consecutive_timeouts = 0;
+                                    outstanding_probes -= 1;
+
+                                    if args.debug > 1 {
+                                        println!("Got a packet back from {:?}", rcvd_icmp_addr);
+                                    }
+                                    if args.debug > 1 {
+                                        println!("ICMP code: {:?}", pkt.get_icmp_code());
+                                        println!("ICMP type: {:?}", pkt.get_icmp_type());
+                                    }
+
+                                    // Am I bleeched?
+                                    let ecn_bleeching_detected = expected_ecn != actual_ecn;
+
+                                    if args.debug > 1 {
+                                        println!("Probe count: {:?}", probe_count);
+
+                                        println!("ECN:");
+                                        println!("{: >15} {: >15}", "Expected:", "Actual:");
+                                        println!(
+                                            "{: >15} {: >15}",
+                                            ecn_to_string(expected_ecn),
+                                            ecn_to_string(actual_ecn)
+                                        );
+                                        println!(
+                                            "Detected bleeching? {:?}",
+                                            ecn_bleeching_detected
+                                        );
+
+                                        println!("TTL:");
+                                        println!("{: >10} {: >10}", "Expected:", "Actual:");
+                                        println!(
+                                            "{: >10} {: >10} (should always be 1)",
+                                            expected_ttl, actual_ttl
+                                        );
+
+                                        println!("Protocol:");
+                                        println!("{: >10} {: >10}", "Expected:", "Actual:");
+                                        println!(
+                                            "{: >10} {: >10}",
+                                            IpNextHeaderProtocols::Test1,
+                                            actual_protocol
+                                        );
+                                    }
+
+                                    let new_hop = Hop::new(
+                                        expected_ttl,
+                                        rcvd_icmp_addr,
+                                        ecn_bleeching_detected,
+                                    );
+                                    if args.debug > 1 {
+                                        println!("Adding a new hop: {:?}", new_hop);
+                                    }
+                                    path.update_hop(expected_ttl, new_hop);
+                                } else {
+                                    println!("Error: Could not get the encapsulated packet from the timeout packet.");
+                                }
+                            } else {
+                                println!(
+                                "Error: Received packet did not parse as an ICMP Timeout packet."
+                            )
+                            }
                         }
+                        VersionedIcmpPacket::Ipv6(_) => {
+                            assert!(false, "Unimplemented.")
+                        }
+                    };
+                } else {
+                    consecutive_timeouts += 1;
+                    if args.debug > 1 {
+                        println!("Had a timeout.")
                     }
                 }
-                VersionedIcmpPacket::Ipv6(pkt) => {}
-            };
-        } else {
-            println!("Timeout waiting for ICMP packet back!");
+
+                // If there are no outstanding probes, then there's no reason to do another read!
+                if outstanding_probes == 0 {
+                    if args.debug > 1 {
+                        println!("Outstanding probes are 0 -- no need to do another read!")
+                    }
+                    break;
+                }
+
+                // There are outstanding probes. Three cases:
+                // 0. Are we out of timeouts? If so, fold.
+                if consecutive_timeouts > 3 {
+                    println!("Reached consecutive timeout limit ... quitting");
+                    break;
+                }
+                // 1. We still have some probes left to send. So, let's send 'em.
+                if attempt_no + 1 < confirmation_count {
+                    println!("Had a timeout, but there are probes left to send. So, we send 'em.");
+                    break;
+                }
+                // 2. We have no probes left to send, but some left to read and more timeouts. Loop and read again.
+            }
+
+            // We are done reading responses.
+            if consecutive_timeouts > 3 {
+                println!("Max timeouts ... quitting.");
+                break;
+            }
+        } // Let's try again with the same TTL.
+
+        if consecutive_timeouts > 3 {
+            println!("Max timeouts ... really quitting.");
+            break;
+        }
+
+        if probe_count == u8::MAX {
+            println!("Max probes reached ... quitting.");
+            break;
+        }
+        if ttl == u8::MAX {
+            println!("Max TTL reached ... quitting.");
+            break;
         }
         println!("Sleeping ...");
         thread::sleep(Duration::from_secs(1));
         println!("... waking");
+
         ttl += 1;
+        probe_count += 1;
     }
+
+    let bleeched_hop = path.bleeched_hop();
+
+    if args.debug > 1 || args.path {
+        println!("path: {}", path);
+    }
+    if args.debug > 1 {
+        println!("bleeching hop: {:?}", path.bleeched_hop());
+    }
+
+    let result = TestResult { path, bleeched_hop };
+
+    let json_test_result = serde_json::to_string(&result).unwrap();
+    println!("result: {}", json_test_result)
 }
