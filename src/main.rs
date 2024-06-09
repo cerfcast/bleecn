@@ -21,7 +21,6 @@ use pnet::transport::{
     Icmpv6TransportChannelIterator,
 };
 use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::Serializer;
 
 #[derive(Debug, Clone)]
 enum Target {
@@ -461,8 +460,8 @@ fn main() {
                                         println!("{: >10} {: >10}", "Expected:", "Actual:");
                                         println!(
                                             "{: >10} {: >10}",
-                                            IpNextHeaderProtocols::Test1,
-                                            actual_protocol
+                                            IpNextHeaderProtocols::Test1.to_string(),
+                                            actual_protocol.to_string()
                                         );
                                     }
 
