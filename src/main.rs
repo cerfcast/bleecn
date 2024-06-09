@@ -120,6 +120,15 @@ struct Args {
     /// Print the discovered path.
     #[arg(short, long, default_value_t = false)]
     path: bool,
+
+    /// Maximum number of consecutive timeouts before quitting.
+    #[arg(long, default_value_t = 3)]
+    timeouts: u32,
+
+
+    /// Number of probes sent per hop to determine bleaching status.
+    #[arg(long, default_value_t = 3)]
+    probe_count: u32,
 }
 
 struct EmptyPacket<'p> {
@@ -344,13 +353,11 @@ fn main() {
         let json_probe_buffer = json_probe.as_bytes();
         */
 
-        let confirmation_count = 3u32;
-
-        // Send out _confirmation_count_ packets per TTL.
+        // Send out args.probe_count packets per TTL.
 
         let mut outstanding_probes = 0u32;
 
-        for attempt_no in 0..confirmation_count {
+        for attempt_no in 0..args.probe_count {
             let probed_ecn = if rand::random() { Ecn::Ect1 } else { Ecn::Ect0 };
             let probe = [probe_count, ttl, probed_ecn as u8];
 
@@ -498,12 +505,12 @@ fn main() {
 
                 // There are outstanding probes. Three cases:
                 // 0. Are we out of timeouts? If so, fold.
-                if consecutive_timeouts > 3 {
+                if consecutive_timeouts >= args.timeouts {
                     println!("Reached consecutive timeout limit ... quitting");
                     break;
                 }
                 // 1. We still have some probes left to send. So, let's send 'em.
-                if attempt_no + 1 < confirmation_count {
+                if attempt_no + 1 < args.probe_count {
                     println!("Had a timeout, but there are probes left to send. So, we send 'em.");
                     break;
                 }
@@ -511,13 +518,13 @@ fn main() {
             }
 
             // We are done reading responses.
-            if consecutive_timeouts > 3 {
+            if consecutive_timeouts >= args.timeouts {
                 println!("Max timeouts ... quitting.");
                 break;
             }
         } // Let's try again with the same TTL.
 
-        if consecutive_timeouts > 3 {
+        if consecutive_timeouts >= args.timeouts {
             println!("Max timeouts ... really quitting.");
             break;
         }
