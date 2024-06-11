@@ -3,7 +3,6 @@ extern crate pnet;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::thread;
 use std::time::Duration;
 
 use clap::Parser;
@@ -120,10 +119,13 @@ struct Args {
     #[arg(short, long, default_value_t = false)]
     path: bool,
 
-    /// Maximum number of consecutive timeouts before quitting.
+    /// Maximum number of consecutive timeouts before considering a hop unreachable.
     #[arg(long, default_value_t = 3)]
-    timeouts: u32,
+    hop_timeouts: u32,
 
+    /// Maximum number of consecutive unreachable hops before determining a path has ended.
+    #[arg(long, default_value_t = 3)]
+    path_timeouts: u32,
 
     /// Number of probes sent per hop to determine bleaching status.
     #[arg(long, default_value_t = 3)]
@@ -344,8 +346,11 @@ fn main() {
         Mode::Ipv6 => IcmpIterable::Ipv6(icmpv6_packet_iter(&mut icmp_rx)),
     };
 
-    let mut consecutive_timeouts = 0u32;
+    let mut consecutive_path_timeouts = 0u32;
+    let mut overall_outstanding_probes = 0u32;
+
     loop {
+        // Probe another hop.
         /*
         let probe = Probe{ttl: ttl, ecn: EcnWrapper{ecn:Ecn::Ect0}};
         let json_probe = serde_json::to_string(&probe).unwrap();
@@ -354,7 +359,8 @@ fn main() {
 
         // Send out args.probe_count packets per TTL.
 
-        let mut outstanding_probes = 0u32;
+        let mut hop_outstanding_probes = 0u32;
+        let mut consecutive_hop_timeouts = 0u32;
 
         for attempt_no in 0..args.probe_count {
             let probed_ecn = if rand::random() { Ecn::Ect1 } else { Ecn::Ect0 };
@@ -384,17 +390,35 @@ fn main() {
                 continue;
             }
 
-            outstanding_probes += 1;
+            overall_outstanding_probes += 1;
+            hop_outstanding_probes += 1;
 
             println!("Sent out the {}th probe for TTL {}.", attempt_no, ttl);
-            println!(
-                "There are {} outstanding probes for this TTL.",
-                outstanding_probes
-            );
-            println!("There are {} consecutive timeouts.", consecutive_timeouts);
+
+            if args.debug > 1 {
+                println!(
+                    "There are {} outstanding probes for this TTL.",
+                    hop_outstanding_probes
+                );
+                println!(
+                    "There are {} overall outstanding probes.",
+                    overall_outstanding_probes
+                );
+                println!(
+                    "There are {} consecutive path timeouts.",
+                    consecutive_path_timeouts
+                );
+                println!(
+                    "There are {} consecutive hop timeouts.",
+                    consecutive_hop_timeouts
+                );
+            }
 
             loop {
+                // (Re)read as long as there are not a maximum number of timeouts and there are outstanding probes.
+
                 let read_result = icmp_rx_iter.next_with_timeout(Duration::from_secs(2));
+
                 if let Some((rcvd_icmp_packet, rcvd_icmp_addr)) = read_result {
                     match rcvd_icmp_packet {
                         VersionedIcmpPacket::Ipv4(pkt) => {
@@ -420,8 +444,12 @@ fn main() {
                                         continue;
                                     }
 
-                                    consecutive_timeouts = 0;
-                                    outstanding_probes -= 1;
+                                    // TODO: Determine whether the packet that came back is for this hop or not.
+
+                                    consecutive_path_timeouts = 0;
+                                    consecutive_hop_timeouts = 0;
+                                    hop_outstanding_probes -= 1;
+                                    overall_outstanding_probes -= 1;
 
                                     if args.debug > 1 {
                                         println!("Got a packet back from {:?}", rcvd_icmp_addr);
@@ -488,14 +516,14 @@ fn main() {
                         }
                     };
                 } else {
-                    consecutive_timeouts += 1;
+                    consecutive_hop_timeouts += 1;
                     if args.debug > 1 {
                         println!("Had a timeout.")
                     }
                 }
 
                 // If there are no outstanding probes, then there's no reason to do another read!
-                if outstanding_probes == 0 {
+                if hop_outstanding_probes == 0 {
                     if args.debug > 1 {
                         println!("Outstanding probes are 0 -- no need to do another read!")
                     }
@@ -504,27 +532,50 @@ fn main() {
 
                 // There are outstanding probes. Three cases:
                 // 0. Are we out of timeouts? If so, fold.
-                if consecutive_timeouts >= args.timeouts {
-                    println!("Reached consecutive timeout limit ... quitting");
+                if consecutive_hop_timeouts >= args.hop_timeouts {
+                    if args.debug > 0 {
+                        println!(
+                        "Reached consecutive timeout limit ... declaring that this hop is offline."
+                    );
+                    }
                     break;
                 }
+
                 // 1. We still have some probes left to send. So, let's send 'em.
                 if attempt_no + 1 < args.probe_count {
-                    println!("Had a timeout, but there are probes left to send. So, we send 'em.");
+                    if args.debug > 0 {
+                        println!(
+                            "Had a timeout, but there are probes left to send. So, we send 'em."
+                        );
+                    }
                     break;
                 }
                 // 2. We have no probes left to send, but some left to read and more timeouts. Loop and read again.
-            }
+            } // Reading probe responses loop.
 
             // We are done reading responses.
-            if consecutive_timeouts >= args.timeouts {
-                println!("Max timeouts ... quitting.");
+            if consecutive_hop_timeouts >= args.hop_timeouts {
+                if args.debug > 0 {
+                    println!("Reached consecutive timeout limit ... declaring (again) that this hop is offline.");
+                }
                 break;
             }
-        } // Let's try again with the same TTL.
+        } // Sending probes to new hops loop.
 
-        if consecutive_timeouts >= args.timeouts {
-            println!("Max timeouts ... really quitting.");
+        if consecutive_hop_timeouts >= args.hop_timeouts {
+            if args.debug > 1 {
+                println!("Adding one to the consecutive path timeouts.\n");
+            }
+            consecutive_path_timeouts += 1;
+        } else {
+            if args.debug > 1 {
+                println!("That hop seems alive. Reset consecutive path timeouts to 0.\n");
+            }
+            consecutive_path_timeouts = 0;
+        }
+
+        if consecutive_path_timeouts >= args.path_timeouts {
+            println!("Too many consecutive path timeouts ... quitting.\n");
             break;
         }
 
@@ -536,12 +587,13 @@ fn main() {
             println!("Max TTL reached ... quitting.");
             break;
         }
-        println!("Sleeping ...");
-        thread::sleep(Duration::from_secs(1));
-        println!("... waking");
 
         ttl += 1;
         probe_count += 1;
+
+        if args.debug > 1 {
+            println!("Moving to the {}th hop\n", ttl);
+        }
     }
 
     let bleeched_hop = path.bleeched_hop();
@@ -549,8 +601,10 @@ fn main() {
     if args.debug > 1 || args.path {
         println!("path: {}", path);
     }
-    if args.debug > 1 {
-        println!("bleeching hop: {:?}", path.bleeched_hop());
+    if let Some(bleeched_hop) = bleeched_hop.clone() {
+        println!("bleeching hop: {:?}", bleeched_hop);
+    } else {
+        println!("No ECN bleeching detected.");
     }
 
     let result = TestResult { path, bleeched_hop };
