@@ -190,9 +190,14 @@ struct Cli {
     #[arg(long, default_value_t = 3)]
     probe_count: u32,
 
-    /// Testing
+    /// Publish results to a repository at the (optionally) specified URL.
     #[arg(long, require_equals = true, default_missing_value = "cloverleaf.cerfca.st", num_args = 0..=1,)]
     publish: Option<String>,
+
+    /// Allow bleaching detection to continue even if there is a path divergence.
+    #[arg(long, default_value_t = false)]
+    permissive: bool
+
 }
 
 #[derive(Serialize)]
@@ -406,8 +411,6 @@ fn main() {
     let baseline_dest_port = 33434u16;
     let baseline_src_port = 54321u16;
 
-    println!("baseline_port: {}", baseline_dest_port);
-
     loop {
         // Probe another hop.
 
@@ -427,7 +430,7 @@ fn main() {
 
             probe_count += 1;
 
-            // TODO: htons
+            // htons (and the opposite direction) are automatically handled by libpnet.
             let encoded_destination_port: u16 = baseline_dest_port + probe.id as u16;
             let encoded_source_port: u16 = baseline_src_port + probe.id as u16;
 
@@ -574,13 +577,16 @@ fn main() {
 
                                         if let Some(existing_new_hop) = &mut new_hop {
                                             if !existing_new_hop.merge(&discovered_hop) {
-                                                if args.debug > 1 {
+                                                if args.debug > 1 || args.permissive {
                                                     println!(
                                                     "{:?} at hop number {} caused path divergence.",
                                                     new_hop, ttl
                                                 );
                                                 }
-                                                path_divergence_detected = true;
+                                                if args.permissive {
+                                                    println!("Warning: Path divergence detected but being overlooked.");
+                                                }
+                                                path_divergence_detected = !args.permissive;
                                             }
                                         } else {
                                             new_hop = Some(discovered_hop);
@@ -734,18 +740,26 @@ fn main() {
     }
 
     if let Some(publish_url) = args.publish {
-        println!("There was a publish_url given: {}.", publish_url);
+
+        if args.debug > 1 {
+            println!("Publishing results to {}.", publish_url);
+        }
+
         let result = TestResult { path, bleeched_hop };
         let json_test_result = serde_json::to_string(&result).unwrap();
-        println!("result: {}", json_test_result);
-        let client = reqwest::blocking::Client::new();
 
+        if args.debug > 1 {
+            println!("Published result JSON: {}", json_test_result);
+        }
+        let client = reqwest::blocking::Client::new();
         if let Err(e) = client
             .post(format!("http://{}:8080/publish/bleecn", publish_url))
             .body(json_test_result)
             .send()
         {
             eprintln!("Error: There was an error posting the result: {}", e);
+        } else {
+            println!("Results successfully published to {}.", publish_url);
         }
     }
 }
