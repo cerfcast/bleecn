@@ -697,8 +697,18 @@ fn main() {
             }
         } // Sending probes to new hops loop.
 
-        if hop_unreachable || path_divergence_detected || encapsulation_error {
-            println!("Ending path tracing because hop is unreachable, divergence detected or an encapsulation error.");
+        if hop_unreachable {
+            println!("Ending path tracing because hop is unreachable.");
+            break;
+        }
+
+        if path_divergence_detected {
+            println!("Ending path tracing because divergence is detected.");
+            break;
+        }
+
+        if encapsulation_error {
+            println!("Ending path tracing because of an encapsulation error.");
             break;
         }
 
