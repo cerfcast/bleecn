@@ -9,8 +9,9 @@ use clap::Parser;
 use pnet::packet::icmp::time_exceeded::TimeExceededPacket;
 use pnet::packet::icmp::IcmpPacket;
 use pnet::packet::icmpv6::Icmpv6Packet;
-use pnet::packet::ip::IpNextHeaderProtocols::{self, Test1};
+use pnet::packet::ip::IpNextHeaderProtocols::{self, Udp};
 use pnet::packet::ipv4::Ipv4Packet;
+use pnet::packet::udp::{MutableUdpPacket, UdpPacket};
 use pnet::packet::Packet;
 use pnet::transport::transport_channel;
 use pnet::transport::TransportChannelType::Layer4;
@@ -32,7 +33,6 @@ enum Target {
 struct Hop {
     pub index: u8,
     pub address: IpAddr,
-    pub diverges: bool,
     pub detected_bleeching: bool,
 }
 
@@ -41,9 +41,13 @@ impl Hop {
         Self {
             index,
             address: addr,
-            diverges: false,
             detected_bleeching: bleeching,
         }
+    }
+
+    fn merge(&mut self, other: &Hop) -> bool {
+        self.detected_bleeching |= other.detected_bleeching;
+        self.address == other.address
     }
 }
 
@@ -123,27 +127,9 @@ struct Args {
     #[arg(long, default_value_t = 3)]
     hop_timeouts: u32,
 
-    /// Maximum number of consecutive unreachable hops before determining a path has ended.
-    #[arg(long, default_value_t = 3)]
-    path_timeouts: u32,
-
     /// Number of probes sent per hop to determine bleaching status.
     #[arg(long, default_value_t = 3)]
     probe_count: u32,
-}
-
-struct EmptyPacket<'p> {
-    buffer: &'p [u8],
-}
-
-impl<'p> Packet for EmptyPacket<'p> {
-    fn packet(&self) -> &[u8] {
-        self.buffer
-    }
-
-    fn payload(&self) -> &[u8] {
-        self.buffer
-    }
 }
 
 #[derive(Serialize)]
@@ -158,15 +144,22 @@ impl Path {
         }
     }
 
-    fn update_hop(&mut self, hop_no: u8, hop: Hop) -> bool {
+    /// Update a hop in a path
+    ///
+    /// If a hop at hop_no does not exist, add it. If a hop at hop_no
+    /// does exist, update it's bleaching status.
+    ///
+    /// Return true if either a new hop is inserted or the existing
+    /// hop's address matches the new hop's address. Return false
+    /// otherwise.
+    fn update_hop(&mut self, hop_no: u8, hop: &Hop) -> bool {
         match self.path.get_mut(&hop_no) {
             Some(existing_hop) => {
-                existing_hop.diverges = existing_hop.address != hop.address;
                 existing_hop.detected_bleeching |= hop.detected_bleeching;
-                existing_hop.diverges
+                existing_hop.address != hop.address
             }
             None => {
-                self.path.insert(hop_no, hop);
+                self.path.insert(hop_no, hop.clone());
                 false
             }
         }
@@ -184,7 +177,6 @@ impl Path {
                     return Some(Hop {
                         index: 0u8,
                         address: IpAddr::V4(Ipv4Addr::LOCALHOST),
-                        diverges: false,
                         detected_bleeching: true,
                     });
                 }
@@ -200,7 +192,6 @@ impl fmt::Display for Path {
         let default_hop = Hop {
             index: 0,
             address: IpAddr::V4(Ipv4Addr::BROADCAST),
-            diverges: false,
             detected_bleeching: false,
         };
         let mut hops: Vec<&u8> = self.path.keys().collect();
@@ -292,13 +283,13 @@ fn main() {
             if args.debug > 1 {
                 println!("Matching mode v4 to set protocol!");
             }
-            Layer4(Ipv4(IpNextHeaderProtocols::Test1))
+            Layer4(Ipv4(IpNextHeaderProtocols::Udp))
         }
         Mode::Ipv6 => {
             if args.debug > 1 {
                 println!("Matching mode v6 to set protocol!");
             }
-            Layer4(Ipv6(IpNextHeaderProtocols::Test1))
+            Layer4(Ipv6(IpNextHeaderProtocols::Udp))
         }
     };
     let icmp_protocol = match mode {
@@ -346,27 +337,35 @@ fn main() {
         Mode::Ipv6 => IcmpIterable::Ipv6(icmpv6_packet_iter(&mut icmp_rx)),
     };
 
-    let mut consecutive_path_timeouts = 0u32;
-    let mut overall_outstanding_probes = 0u32;
+    let mut path_divergence_detected = false;
+    let mut encapsulation_error = false;
 
     loop {
         // Probe another hop.
-        /*
-        let probe = Probe{ttl: ttl, ecn: EcnWrapper{ecn:Ecn::Ect0}};
-        let json_probe = serde_json::to_string(&probe).unwrap();
-        let json_probe_buffer = json_probe.as_bytes();
-        */
-
-        // Send out args.probe_count packets per TTL.
 
         let mut hop_outstanding_probes = 0u32;
         let mut consecutive_hop_timeouts = 0u32;
+        let mut hop_unreachable = false;
 
+        let mut new_hop: Option<Hop> = None;
+        // Send out args.probe_count packets per TTL.
         for attempt_no in 0..args.probe_count {
             let probed_ecn = if rand::random() { Ecn::Ect1 } else { Ecn::Ect0 };
-            let probe = [probe_count, ttl, probed_ecn as u8];
 
-            let maybe_packet = EmptyPacket { buffer: &probe };
+            let encoded_destination_port: u16 = ((ttl as u16) << 8) | probed_ecn as u16;
+
+            let mut probe_packet_data = [0; UdpPacket::minimum_packet_size()];
+
+            let mut maybe_packet = MutableUdpPacket::new(&mut probe_packet_data).unwrap();
+
+            let udp = pnet::packet::udp::Udp {
+                source: 54321,
+                destination: encoded_destination_port,
+                length: UdpPacket::minimum_packet_size() as u16,
+                checksum: 0,
+                payload: [].to_vec(),
+            };
+            maybe_packet.populate(&udp);
 
             if let Err(err) = tx.set_ecn(probed_ecn) {
                 println!(
@@ -390,7 +389,6 @@ fn main() {
                 continue;
             }
 
-            overall_outstanding_probes += 1;
             hop_outstanding_probes += 1;
 
             println!("Sent out the {}th probe for TTL {}.", attempt_no, ttl);
@@ -399,14 +397,6 @@ fn main() {
                 println!(
                     "There are {} outstanding probes for this TTL.",
                     hop_outstanding_probes
-                );
-                println!(
-                    "There are {} overall outstanding probes.",
-                    overall_outstanding_probes
-                );
-                println!(
-                    "There are {} consecutive path timeouts.",
-                    consecutive_path_timeouts
                 );
                 println!(
                     "There are {} consecutive hop timeouts.",
@@ -424,91 +414,109 @@ fn main() {
                         VersionedIcmpPacket::Ipv4(pkt) => {
                             if let Some(timeout_pkt) = TimeExceededPacket::new(pkt.packet()) {
                                 if let Some(inner_pkt) = Ipv4Packet::new(timeout_pkt.payload()) {
-                                    // Get the data from inside the packet that is reflected back.
-                                    let probe_count = inner_pkt.payload()[0];
+                                    if let Some(udp_packet) = UdpPacket::new(inner_pkt.payload()) {
+                                        // Get the data from inside the packet that is reflected back.
+                                        let expected_ttl: u8 =
+                                            (udp_packet.get_destination() >> 8) as u8;
+                                        let expected_ecn_raw: u8 =
+                                            (udp_packet.get_destination() & 0xff) as u8;
+                                        let expected_ecn: Ecn = Ecn::from(expected_ecn_raw);
 
-                                    let expected_ttl = inner_pkt.payload()[1];
-                                    let expected_ecn_raw = inner_pkt.payload()[2];
-                                    let expected_ecn: Ecn = Ecn::from(expected_ecn_raw);
+                                        // Get the data about the packet that is reflected back.
+                                        let actual_ecn = Ecn::from(inner_pkt.get_ecn());
+                                        let actual_protocol = inner_pkt.get_next_level_protocol();
+                                        let actual_ttl = inner_pkt.get_ttl();
 
-                                    // Get the data about the packet that is reflected back.
-                                    let actual_ecn = Ecn::from(inner_pkt.get_ecn());
-                                    let actual_protocol = inner_pkt.get_next_level_protocol();
-                                    let actual_ttl = inner_pkt.get_ttl();
+                                        // Am I bleeched?
+                                        let ecn_bleeching_detected = expected_ecn != actual_ecn;
 
-                                    // It's possible that we received a non-test packet back. Let's reject it.
-                                    if actual_protocol != Test1 {
-                                        if args.debug > 1 {
-                                            println!("Discarding a non test packet.")
+                                        // It's possible that we received a non-test packet back. Let's reject it.
+                                        if actual_protocol != Udp {
+                                            if args.debug > 1 {
+                                                println!("Discarding a non test packet.")
+                                            }
+                                            continue;
                                         }
-                                        continue;
-                                    }
 
-                                    // TODO: Determine whether the packet that came back is for this hop or not.
+                                        consecutive_hop_timeouts = 0;
+                                        hop_outstanding_probes -= 1;
 
-                                    consecutive_path_timeouts = 0;
-                                    consecutive_hop_timeouts = 0;
-                                    hop_outstanding_probes -= 1;
-                                    overall_outstanding_probes -= 1;
+                                        if args.debug > 1 {
+                                            println!("Got a packet back from {:?}", rcvd_icmp_addr);
+                                        }
+                                        if args.debug > 1 {
+                                            println!("ICMP code: {:?}", pkt.get_icmp_code());
+                                            println!("ICMP type: {:?}", pkt.get_icmp_type());
+                                        }
 
-                                    if args.debug > 1 {
-                                        println!("Got a packet back from {:?}", rcvd_icmp_addr);
-                                    }
-                                    if args.debug > 1 {
-                                        println!("ICMP code: {:?}", pkt.get_icmp_code());
-                                        println!("ICMP type: {:?}", pkt.get_icmp_type());
-                                    }
+                                        if args.debug > 1 {
+                                            println!("Probe count: {:?}", probe_count);
 
-                                    // Am I bleeched?
-                                    let ecn_bleeching_detected = expected_ecn != actual_ecn;
+                                            println!("ECN:");
+                                            println!("{: >15} {: >15}", "Expected:", "Actual:");
+                                            println!(
+                                                "{: >15} {: >15}",
+                                                ecn_to_string(expected_ecn),
+                                                ecn_to_string(actual_ecn)
+                                            );
+                                            println!(
+                                                "Detected bleeching? {:?}",
+                                                ecn_bleeching_detected
+                                            );
 
-                                    if args.debug > 1 {
-                                        println!("Probe count: {:?}", probe_count);
+                                            println!("TTL:");
+                                            println!("{: >10} {: >10}", "Expected:", "Actual:");
+                                            println!(
+                                                "{: >10} {: >10} (should always be 1)",
+                                                expected_ttl, actual_ttl
+                                            );
 
-                                        println!("ECN:");
-                                        println!("{: >15} {: >15}", "Expected:", "Actual:");
-                                        println!(
-                                            "{: >15} {: >15}",
-                                            ecn_to_string(expected_ecn),
-                                            ecn_to_string(actual_ecn)
+                                            println!("Protocol:");
+                                            println!("{: >10} {: >10}", "Expected:", "Actual:");
+                                            println!(
+                                                "{: >10} {: >10}",
+                                                IpNextHeaderProtocols::Udp.to_string(),
+                                                actual_protocol.to_string()
+                                            );
+                                        }
+
+                                        let discovered_hop = Hop::new(
+                                            expected_ttl,
+                                            rcvd_icmp_addr,
+                                            ecn_bleeching_detected,
                                         );
-                                        println!(
-                                            "Detected bleeching? {:?}",
-                                            ecn_bleeching_detected
-                                        );
 
-                                        println!("TTL:");
-                                        println!("{: >10} {: >10}", "Expected:", "Actual:");
-                                        println!(
-                                            "{: >10} {: >10} (should always be 1)",
-                                            expected_ttl, actual_ttl
-                                        );
+                                        if let Some(existing_new_hop) = &mut new_hop {
+                                            if !existing_new_hop.merge(&discovered_hop) {
+                                                if args.debug > 1 {
+                                                    println!(
+                                                    "{:?} at hop number {} caused path divergence.",
+                                                    new_hop, ttl
+                                                );
+                                                }
+                                                path_divergence_detected = true;
+                                            }
+                                        } else {
+                                            new_hop = Some(discovered_hop);
+                                        }
 
-                                        println!("Protocol:");
-                                        println!("{: >10} {: >10}", "Expected:", "Actual:");
-                                        println!(
-                                            "{: >10} {: >10}",
-                                            IpNextHeaderProtocols::Test1.to_string(),
-                                            actual_protocol.to_string()
+                                        if args.debug > 1 {
+                                            println!(
+                                            "The hop being discovered currently looks like: {:?}",
+                                            new_hop.clone().unwrap()
                                         );
+                                        }
+                                    } else {
+                                        eprintln!("Error: Timeout packet's embedded IP packet did not contain a UDP packet.");
+                                        encapsulation_error = true;
                                     }
-
-                                    let new_hop = Hop::new(
-                                        expected_ttl,
-                                        rcvd_icmp_addr,
-                                        ecn_bleeching_detected,
-                                    );
-                                    if args.debug > 1 {
-                                        println!("Adding a new hop: {:?}", new_hop);
-                                    }
-                                    path.update_hop(expected_ttl, new_hop);
                                 } else {
-                                    println!("Error: Could not get the encapsulated packet from the timeout packet.");
+                                    eprintln!("Error: Timeout packet contents did not contain an IP packet.");
+                                    encapsulation_error = true;
                                 }
                             } else {
-                                println!(
-                                "Error: Received packet did not parse as an ICMP Timeout packet."
-                            )
+                                eprintln!("Error: Received packet did not parse as an ICMP Timeout packet.");
+                                encapsulation_error = true;
                             }
                         }
                         VersionedIcmpPacket::Ipv6(_) => {
@@ -522,6 +530,16 @@ fn main() {
                     }
                 }
 
+                if encapsulation_error {
+                    break;
+                }
+
+                // Information from the packet that was just read indicated that the traced
+                // path exhibited divergence.
+                if path_divergence_detected {
+                    break;
+                }
+
                 // If there are no outstanding probes, then there's no reason to do another read!
                 if hop_outstanding_probes == 0 {
                     if args.debug > 1 {
@@ -530,7 +548,11 @@ fn main() {
                     break;
                 }
 
-                // There are outstanding probes. Three cases:
+                // There are outstanding probes.
+                assert!(hop_outstanding_probes != 0);
+
+                // Now that it is safe to assume that there are outstanding probes, it is necessary
+                // to handle three possible situations:
                 // 0. Are we out of timeouts? If so, fold.
                 if consecutive_hop_timeouts >= args.hop_timeouts {
                     if args.debug > 0 {
@@ -541,7 +563,8 @@ fn main() {
                     break;
                 }
 
-                // 1. We still have some probes left to send. So, let's send 'em.
+                // 1. We still have some probes left to send. So, break out of the reading loop
+                //    and send another probe.
                 if attempt_no + 1 < args.probe_count {
                     if args.debug > 0 {
                         println!(
@@ -550,33 +573,48 @@ fn main() {
                     }
                     break;
                 }
-                // 2. We have no probes left to send, but some left to read and more timeouts. Loop and read again.
+                // 2. We have no probes left to send. Combined with earlier knowledge (i.e., that
+                //    there are outstanding probes left to read and there are more timeouts available),
+                //    continue the read loop and try to read another packet.
+                continue;
             } // Reading probe responses loop.
 
-            // We are done reading responses.
+            // For some reasone, we are done reading responses ...
+
+            // ... if that reason is that we ran out of timeouts, then we declare that this
+            //     hop is offline.
             if consecutive_hop_timeouts >= args.hop_timeouts {
                 if args.debug > 0 {
                     println!("Reached consecutive timeout limit ... declaring (again) that this hop is offline.");
                 }
+                hop_unreachable = true;
+                break;
+            }
+
+            // ... if that reason is that there was a path divergence, then we are done.
+            if path_divergence_detected {
+                break;
+            }
+
+            // ... if that reason is that there was a encapsulation error, then we are done.
+            if encapsulation_error {
                 break;
             }
         } // Sending probes to new hops loop.
 
-        if consecutive_hop_timeouts >= args.hop_timeouts {
-            if args.debug > 1 {
-                println!("Adding one to the consecutive path timeouts.\n");
-            }
-            consecutive_path_timeouts += 1;
-        } else {
-            if args.debug > 1 {
-                println!("That hop seems alive. Reset consecutive path timeouts to 0.\n");
-            }
-            consecutive_path_timeouts = 0;
+        if hop_unreachable || path_divergence_detected || encapsulation_error {
+            println!("Ending path tracing because hop is unreachable, divergence detected or an encapsulation error.");
+            break;
         }
 
-        if consecutive_path_timeouts >= args.path_timeouts {
-            println!("Too many consecutive path timeouts ... quitting.\n");
-            break;
+        // We know that new_hop can be added to the path.
+        if let Some(new_hop) = new_hop {
+            path.update_hop(ttl, &new_hop);
+        } else {
+            eprintln!(
+                "Error: The {}th hop was alive but no hop information was collected.",
+                ttl
+            );
         }
 
         if probe_count == u8::MAX {
