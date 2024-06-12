@@ -403,7 +403,10 @@ fn main() {
     let mut path_divergence_detected = false;
     let mut encapsulation_error = false;
 
-    let baseline_port = (123u16) << 8;
+    let baseline_dest_port = 33434u16;
+    let baseline_src_port = 54321u16;
+
+    println!("baseline_port: {}", baseline_dest_port);
 
     loop {
         // Probe another hop.
@@ -425,19 +428,21 @@ fn main() {
             probe_count += 1;
 
             // TODO: htons
-            let encoded_destination_port: u16 = baseline_port | probe.id as u16;
+            let encoded_destination_port: u16 = baseline_dest_port + probe.id as u16;
+            let encoded_source_port: u16 = baseline_src_port + probe.id as u16;
 
             let mut probe_packet_data = [0; UdpPacket::minimum_packet_size()];
 
             let mut maybe_packet = MutableUdpPacket::new(&mut probe_packet_data).unwrap();
 
             let udp = pnet::packet::udp::Udp {
-                source: 54321,
+                source: encoded_source_port,
                 destination: encoded_destination_port,
                 length: UdpPacket::minimum_packet_size() as u16,
                 checksum: 0,
                 payload: [].to_vec(),
             };
+
             maybe_packet.populate(&udp);
 
             if let Err(err) = tx.set_ecn(probe.ecn) {
@@ -493,7 +498,13 @@ fn main() {
                             if let Some(timeout_pkt) = TimeExceededPacket::new(pkt.packet()) {
                                 if let Some(inner_pkt) = Ipv4Packet::new(timeout_pkt.payload()) {
                                     if let Some(udp_packet) = UdpPacket::new(inner_pkt.payload()) {
-                                        let rcvd_probe_id: u8 = udp_packet.get_destination() as u8;
+
+                                        if target != inner_pkt.get_destination() {
+                                            eprintln!("Packet response with address that does not match our target.");
+                                            continue;
+                                        }
+
+                                        let rcvd_probe_id: u8 = (udp_packet.get_destination() - baseline_dest_port) as u8;
 
                                         let rcvd_probe = outstanding_probes.get(rcvd_probe_id);
                                         if rcvd_probe.is_none() {
