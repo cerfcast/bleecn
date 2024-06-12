@@ -1,5 +1,6 @@
 extern crate pnet;
 
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -9,7 +10,7 @@ use clap::Parser;
 use pnet::packet::icmp::time_exceeded::TimeExceededPacket;
 use pnet::packet::icmp::IcmpPacket;
 use pnet::packet::icmpv6::Icmpv6Packet;
-use pnet::packet::ip::IpNextHeaderProtocols::{self, Udp};
+use pnet::packet::ip::IpNextHeaderProtocols;
 use pnet::packet::ipv4::Ipv4Packet;
 use pnet::packet::udp::{MutableUdpPacket, UdpPacket};
 use pnet::packet::Packet;
@@ -77,6 +78,64 @@ impl<'de> Deserialize<'de> for EcnWrapper {
     }
 }
 
+#[derive(Clone, PartialEq)]
+struct Probe {
+    pub id: u8,
+    pub ttl: u8,
+    pub ecn: Ecn,
+}
+
+enum ProbeSetError {
+    ProbeExists,
+    ProbeDoesNotExist,
+}
+
+impl fmt::Display for ProbeSetError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ProbeSetError::ProbeExists => write!(f, "Probe exists"),
+            ProbeSetError::ProbeDoesNotExist => write!(f, "Probe does not exist"),
+        }
+    }
+}
+
+struct ProbeSet {
+    probes: HashMap<u8, Probe>,
+}
+
+impl ProbeSet {
+    pub fn new() -> Self {
+        Self {
+            probes: HashMap::new(),
+        }
+    }
+
+    pub fn count(&self) -> usize {
+        self.probes.len()
+    }
+
+    pub fn ack(&mut self, probe: &Probe) -> Result<(), ProbeSetError> {
+        if self.probes.remove(&probe.id).is_some() {
+            Ok(())
+        } else {
+            Err(ProbeSetError::ProbeDoesNotExist)
+        }
+    }
+
+    pub fn insert(&mut self, probe: &Probe) -> Result<(), ProbeSetError> {
+        if let Entry::Vacant(_) = self.probes.entry(probe.id) {
+            self.probes.insert(probe.id, probe.clone());
+            Ok(())
+        } else {
+            Err(ProbeSetError::ProbeExists)
+        }
+    }
+
+    pub fn get(&self, id: u8) -> Option<Probe> {
+        self.probes.get(&id).cloned()
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Mode {
     Ipv6,
@@ -111,7 +170,7 @@ fn ecn_to_string(ecn: Ecn) -> String {
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
-struct Args {
+struct Cli {
     /// Where to send IP packets.
     #[arg(short, value_parser = parse_target)]
     target: Target,
@@ -130,6 +189,10 @@ struct Args {
     /// Number of probes sent per hop to determine bleaching status.
     #[arg(long, default_value_t = 3)]
     probe_count: u32,
+
+    /// Testing
+    #[arg(long, require_equals = true, default_missing_value = "cloverleaf.cerfca.st", num_args = 0..=1,)]
+    publish: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -197,11 +260,11 @@ impl fmt::Display for Path {
         let mut hops: Vec<&u8> = self.path.keys().collect();
         hops.sort();
         for hop in hops {
-            write!(
+            writeln!(
                 f,
-                "{}: {:?}\n",
+                "{}: {:?}",
                 hop,
-                self.path.get(&hop).unwrap_or(&default_hop.clone())
+                self.path.get(hop).unwrap_or(&default_hop.clone())
             )?;
         }
         Ok(())
@@ -241,7 +304,7 @@ impl<'a> IcmpIterable<'a> {
 }
 
 fn main() {
-    let args = Args::parse();
+    let args = Cli::parse();
 
     //let mut path: HashMap<u8, Hop> = HashMap::new();
     let mut path = Path::new();
@@ -340,19 +403,29 @@ fn main() {
     let mut path_divergence_detected = false;
     let mut encapsulation_error = false;
 
+    let baseline_port = (123u16) << 8;
+
     loop {
         // Probe another hop.
 
-        let mut hop_outstanding_probes = 0u32;
+        let mut outstanding_probes = ProbeSet::new();
+
         let mut consecutive_hop_timeouts = 0u32;
         let mut hop_unreachable = false;
 
         let mut new_hop: Option<Hop> = None;
         // Send out args.probe_count packets per TTL.
         for attempt_no in 0..args.probe_count {
-            let probed_ecn = if rand::random() { Ecn::Ect1 } else { Ecn::Ect0 };
+            let probe = Probe {
+                id: probe_count,
+                ttl,
+                ecn: if rand::random() { Ecn::Ect1 } else { Ecn::Ect0 },
+            };
 
-            let encoded_destination_port: u16 = ((ttl as u16) << 8) | probed_ecn as u16;
+            probe_count += 1;
+
+            // TODO: htons
+            let encoded_destination_port: u16 = baseline_port | probe.id as u16;
 
             let mut probe_packet_data = [0; UdpPacket::minimum_packet_size()];
 
@@ -367,7 +440,7 @@ fn main() {
             };
             maybe_packet.populate(&udp);
 
-            if let Err(err) = tx.set_ecn(probed_ecn) {
+            if let Err(err) = tx.set_ecn(probe.ecn) {
                 println!(
                     "Failed to set the ECN bit for the sender (Error: {:?}). Will retry later!",
                     err
@@ -389,14 +462,19 @@ fn main() {
                 continue;
             }
 
-            hop_outstanding_probes += 1;
+            if let Err(e) = outstanding_probes.insert(&probe) {
+                eprintln!(
+                    "Error: Could not add a probe to the outstanding probe set: {}",
+                    e
+                );
+            }
 
             println!("Sent out the {}th probe for TTL {}.", attempt_no, ttl);
 
             if args.debug > 1 {
                 println!(
                     "There are {} outstanding probes for this TTL.",
-                    hop_outstanding_probes
+                    outstanding_probes.count()
                 );
                 println!(
                     "There are {} consecutive hop timeouts.",
@@ -415,48 +493,45 @@ fn main() {
                             if let Some(timeout_pkt) = TimeExceededPacket::new(pkt.packet()) {
                                 if let Some(inner_pkt) = Ipv4Packet::new(timeout_pkt.payload()) {
                                     if let Some(udp_packet) = UdpPacket::new(inner_pkt.payload()) {
-                                        // Get the data from inside the packet that is reflected back.
-                                        let expected_ttl: u8 =
-                                            (udp_packet.get_destination() >> 8) as u8;
-                                        let expected_ecn_raw: u8 =
-                                            (udp_packet.get_destination() & 0xff) as u8;
-                                        let expected_ecn: Ecn = Ecn::from(expected_ecn_raw);
+                                        let rcvd_probe_id: u8 = udp_packet.get_destination() as u8;
 
-                                        // Get the data about the packet that is reflected back.
+                                        let rcvd_probe = outstanding_probes.get(rcvd_probe_id);
+                                        if rcvd_probe.is_none() {
+                                            eprintln!("Could not retrieve the outstanding probe matching id {}.", rcvd_probe_id);
+                                            continue;
+                                        }
+                                        let rcvd_probe = rcvd_probe.unwrap();
+
+                                        if let Err(e) = outstanding_probes.ack(&rcvd_probe) {
+                                            eprintln!("Could not acknowledge the outstanding probe matching id {}: {}.", rcvd_probe_id, e);
+                                            continue;
+                                        }
+
+                                        // We have a valid response; reset per-hop read timeouts.
+                                        consecutive_hop_timeouts = 0;
+
+                                        // Get the data from inside the packet that is reflected back.
                                         let actual_ecn = Ecn::from(inner_pkt.get_ecn());
                                         let actual_protocol = inner_pkt.get_next_level_protocol();
                                         let actual_ttl = inner_pkt.get_ttl();
 
                                         // Am I bleeched?
-                                        let ecn_bleeching_detected = expected_ecn != actual_ecn;
-
-                                        // It's possible that we received a non-test packet back. Let's reject it.
-                                        if actual_protocol != Udp {
-                                            if args.debug > 1 {
-                                                println!("Discarding a non test packet.")
-                                            }
-                                            continue;
-                                        }
-
-                                        consecutive_hop_timeouts = 0;
-                                        hop_outstanding_probes -= 1;
+                                        let ecn_bleeching_detected = rcvd_probe.ecn != actual_ecn;
 
                                         if args.debug > 1 {
                                             println!("Got a packet back from {:?}", rcvd_icmp_addr);
-                                        }
-                                        if args.debug > 1 {
-                                            println!("ICMP code: {:?}", pkt.get_icmp_code());
-                                            println!("ICMP type: {:?}", pkt.get_icmp_type());
-                                        }
-
-                                        if args.debug > 1 {
+                                            println!(
+                                                "ICMP code: {:?}; type: {:?}",
+                                                pkt.get_icmp_code(),
+                                                pkt.get_icmp_type()
+                                            );
                                             println!("Probe count: {:?}", probe_count);
 
                                             println!("ECN:");
                                             println!("{: >15} {: >15}", "Expected:", "Actual:");
                                             println!(
                                                 "{: >15} {: >15}",
-                                                ecn_to_string(expected_ecn),
+                                                ecn_to_string(rcvd_probe.ecn),
                                                 ecn_to_string(actual_ecn)
                                             );
                                             println!(
@@ -468,7 +543,7 @@ fn main() {
                                             println!("{: >10} {: >10}", "Expected:", "Actual:");
                                             println!(
                                                 "{: >10} {: >10} (should always be 1)",
-                                                expected_ttl, actual_ttl
+                                                rcvd_probe.ttl, actual_ttl
                                             );
 
                                             println!("Protocol:");
@@ -481,7 +556,7 @@ fn main() {
                                         }
 
                                         let discovered_hop = Hop::new(
-                                            expected_ttl,
+                                            rcvd_probe.ttl,
                                             rcvd_icmp_addr,
                                             ecn_bleeching_detected,
                                         );
@@ -520,7 +595,10 @@ fn main() {
                             }
                         }
                         VersionedIcmpPacket::Ipv6(_) => {
-                            assert!(false, "Unimplemented.")
+                            #[allow(clippy::assertions_on_constants)]
+                            {
+                                assert!(false, "Unimplemented.")
+                            }
                         }
                     };
                 } else {
@@ -541,7 +619,7 @@ fn main() {
                 }
 
                 // If there are no outstanding probes, then there's no reason to do another read!
-                if hop_outstanding_probes == 0 {
+                if outstanding_probes.count() == 0 {
                     if args.debug > 1 {
                         println!("Outstanding probes are 0 -- no need to do another read!")
                     }
@@ -549,7 +627,7 @@ fn main() {
                 }
 
                 // There are outstanding probes.
-                assert!(hop_outstanding_probes != 0);
+                assert!(outstanding_probes.count() != 0);
 
                 // Now that it is safe to assume that there are outstanding probes, it is necessary
                 // to handle three possible situations:
@@ -579,7 +657,7 @@ fn main() {
                 continue;
             } // Reading probe responses loop.
 
-            // For some reasone, we are done reading responses ...
+            // For some reason, we are done reading responses ...
 
             // ... if that reason is that we ran out of timeouts, then we declare that this
             //     hop is offline.
@@ -627,7 +705,6 @@ fn main() {
         }
 
         ttl += 1;
-        probe_count += 1;
 
         if args.debug > 1 {
             println!("Moving to the {}th hop\n", ttl);
@@ -645,8 +722,19 @@ fn main() {
         println!("No ECN bleeching detected.");
     }
 
-    let result = TestResult { path, bleeched_hop };
+    if let Some(publish_url) = args.publish {
+        println!("There was a publish_url given: {}.", publish_url);
+        let result = TestResult { path, bleeched_hop };
+        let json_test_result = serde_json::to_string(&result).unwrap();
+        println!("result: {}", json_test_result);
+        let client = reqwest::blocking::Client::new();
 
-    let json_test_result = serde_json::to_string(&result).unwrap();
-    println!("result: {}", json_test_result)
+        if let Err(e) = client
+            .post(format!("http://{}:8080/publish/bleecn", publish_url))
+            .body(json_test_result)
+            .send()
+        {
+            eprintln!("Error: There was an error posting the result: {}", e);
+        }
+    }
 }
