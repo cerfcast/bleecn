@@ -144,6 +144,7 @@ enum Mode {
 
 #[derive(Serialize)]
 struct TestResult {
+    pub target: IpAddr,
     #[serde(flatten)]
     pub path: Path,
     pub bleeched_hop: Option<Hop>,
@@ -191,13 +192,12 @@ struct Cli {
     probe_count: u32,
 
     /// Publish results to a repository at the (optionally) specified URL.
-    #[arg(long, require_equals = true, default_missing_value = "cloverleaf.cerfca.st", num_args = 0..=1,)]
+    #[arg(long, require_equals = true, default_missing_value = "data.cerfca.st", num_args = 0..=1,)]
     publish: Option<String>,
 
     /// Allow bleaching detection to continue even if there is a path divergence.
     #[arg(long, default_value_t = false)]
-    permissive: bool
-
+    permissive: bool,
 }
 
 #[derive(Serialize)]
@@ -501,13 +501,14 @@ fn main() {
                             if let Some(timeout_pkt) = TimeExceededPacket::new(pkt.packet()) {
                                 if let Some(inner_pkt) = Ipv4Packet::new(timeout_pkt.payload()) {
                                     if let Some(udp_packet) = UdpPacket::new(inner_pkt.payload()) {
-
                                         if target != inner_pkt.get_destination() {
                                             eprintln!("Packet response with address that does not match our target.");
                                             continue;
                                         }
 
-                                        let rcvd_probe_id: u8 = (udp_packet.get_destination() - baseline_dest_port) as u8;
+                                        let rcvd_probe_id: u8 = (udp_packet.get_destination()
+                                            - baseline_dest_port)
+                                            as u8;
 
                                         let rcvd_probe = outstanding_probes.get(rcvd_probe_id);
                                         if rcvd_probe.is_none() {
@@ -750,26 +751,41 @@ fn main() {
     }
 
     if let Some(publish_url) = args.publish {
-
         if args.debug > 1 {
             println!("Publishing results to {}.", publish_url);
         }
 
-        let result = TestResult { path, bleeched_hop };
+        let result = TestResult {
+            target,
+            path,
+            bleeched_hop,
+        };
         let json_test_result = serde_json::to_string(&result).unwrap();
+        let json_test_result_pretty = serde_json::to_string_pretty(&result).unwrap();
 
-        if args.debug > 1 {
-            println!("Published result JSON: {}", json_test_result);
-        }
         let client = reqwest::blocking::Client::new();
-        if let Err(e) = client
-            .post(format!("http://{}:8080/publish/bleecn", publish_url))
-            .body(json_test_result)
-            .send()
-        {
+        let result_post_status = client
+            .post(format!("https://{}/api/publish/bleecn", publish_url))
+            .body(json_test_result.clone())
+            .send();
+        if let Err(e) = result_post_status {
             eprintln!("Error: There was an error posting the result: {}", e);
         } else {
-            println!("Results successfully published to {}.", publish_url);
+            let result_post_status = result_post_status.unwrap();
+            if result_post_status.status().is_success() {
+                if args.debug > 1 {
+                    println!(
+                        "The result posted to {} looked like: {}",
+                        publish_url, json_test_result_pretty
+                    );
+                }
+                println!("Results successfully published to {}.", publish_url);
+            } else {
+                eprintln!(
+                    "Error: Server reported {} when posting the results.",
+                    result_post_status.status()
+                );
+            }
         }
     }
 }
