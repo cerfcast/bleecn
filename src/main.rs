@@ -411,6 +411,12 @@ fn main() {
     let baseline_dest_port = 33434u16;
     let baseline_src_port = 54321u16;
 
+
+    if let Err(err) = tx.configure_path_mtu(false) {
+        println!("An error occurred while disabling path MTU discovery on the transport channel: {}", err);
+        return;
+    }
+
     loop {
         // Probe another hop.
 
@@ -434,16 +440,16 @@ fn main() {
             let encoded_destination_port: u16 = baseline_dest_port + probe.id as u16;
             let encoded_source_port: u16 = baseline_src_port + probe.id as u16;
 
-            let mut probe_packet_data = [0; UdpPacket::minimum_packet_size()];
+            let mut probe_packet_data = [0; UdpPacket::minimum_packet_size() + 32];
 
             let mut maybe_packet = MutableUdpPacket::new(&mut probe_packet_data).unwrap();
 
             let udp = pnet::packet::udp::Udp {
                 source: encoded_source_port,
                 destination: encoded_destination_port,
-                length: UdpPacket::minimum_packet_size() as u16,
+                length: (UdpPacket::minimum_packet_size() + 32) as u16,
                 checksum: 0,
-                payload: [].to_vec(),
+                payload: [0xff as u8; 32].to_vec(),
             };
 
             maybe_packet.populate(&udp);
