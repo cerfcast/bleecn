@@ -735,20 +735,23 @@ fn main() {
             break;
         }
 
-        // We know that new_hop can be added to the path.
-        if let Some(new_hop) = new_hop {
-            path.update_hop(ttl, &new_hop);
-            if new_hop.address == target {
-                println!("Target reached!");
-                break;
+        // If we are in go mode, we could get here and have an unreachable hop. Because *some* probe
+        // packet could have come back, we need to explicitly opt out of this path insertion!
+        if !hop_unreachable {
+            // We know that new_hop can be added to the path.
+            if let Some(new_hop) = new_hop {
+                path.update_hop(ttl, &new_hop);
+                if new_hop.address == target {
+                    println!("Target reached!");
+                    break;
+                }
+            } else {
+                eprintln!(
+                    "Error: The {}th hop was alive but no hop information was collected.",
+                    ttl
+                );
             }
-        } else {
-            eprintln!(
-                "Error: The {}th hop was alive but no hop information was collected.",
-                ttl
-            );
         }
-
 
         if probe_count == u8::MAX {
             println!("Max probes reached ... quitting.");
