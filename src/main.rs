@@ -198,6 +198,10 @@ struct Cli {
     /// Allow bleaching detection to continue even if there is a path divergence.
     #[arg(long, default_value_t = false)]
     permissive: bool,
+
+    /// Don't let unreachable hops stop us from continuing until we hit a certain number of hops.
+    #[arg(long, require_equals = true, default_missing_value = "30", num_args = 0..=1,)]
+    go: Option<u8>,
 }
 
 #[derive(Serialize)]
@@ -314,6 +318,15 @@ fn main() {
     //let mut path: HashMap<u8, Hop> = HashMap::new();
     let mut path = Path::new();
 
+    let has_go_mode = match args.go {
+        Some(_) => true,
+        _ => false,
+    };
+
+    if has_go_mode && args.debug > 1 {
+        println!("Enabling go mode.");
+    }
+
     let (target, mode) = match args.target.clone() {
         Target::Name(name) => {
             let hostname_with_dummy_port = name.clone() + ":80";
@@ -411,9 +424,11 @@ fn main() {
     let baseline_dest_port = 33434u16;
     let baseline_src_port = 54321u16;
 
-
     if let Err(err) = tx.configure_path_mtu(false) {
-        println!("An error occurred while disabling path MTU discovery on the transport channel: {}", err);
+        println!(
+            "An error occurred while disabling path MTU discovery on the transport channel: {}",
+            err
+        );
         return;
     }
 
@@ -590,10 +605,7 @@ fn main() {
                                                     new_hop, ttl
                                                 );
                                                 }
-                                                if args.permissive {
-                                                    println!("Warning: Path divergence detected but being overlooked.");
-                                                }
-                                                path_divergence_detected = !args.permissive;
+                                                path_divergence_detected = true;
                                             }
                                         } else {
                                             new_hop = Some(discovered_hop);
@@ -632,13 +644,8 @@ fn main() {
                     }
                 }
 
-                if encapsulation_error {
-                    break;
-                }
-
-                // Information from the packet that was just read indicated that the traced
-                // path exhibited divergence.
-                if path_divergence_detected {
+                // All warnings handled when detected.
+                if encapsulation_error || path_divergence_detected {
                     break;
                 }
 
@@ -681,37 +688,46 @@ fn main() {
                 continue;
             } // Reading probe responses loop.
 
-            // For some reason, we are done reading responses ...
-
-            // ... if that reason is that we ran out of timeouts, then we declare that this
-            //     hop is offline.
             if consecutive_hop_timeouts >= args.hop_timeouts {
                 if args.debug > 0 {
                     println!("Reached consecutive timeout limit ... declaring (again) that this hop is offline.");
                 }
                 hop_unreachable = true;
-                break;
             }
 
+            // For some reason, we are done reading responses ...
             // ... if that reason is that there was a path divergence, then we are done.
-            if path_divergence_detected {
-                break;
-            }
-
             // ... if that reason is that there was a encapsulation error, then we are done.
-            if encapsulation_error {
+            // ... if that reason is that we ran out of timeouts, then we declare that this
+            //     hop is offline.
+            if path_divergence_detected || encapsulation_error || hop_unreachable {
                 break;
             }
         } // Sending probes to new hops loop.
 
         if hop_unreachable {
-            println!("Ending path tracing because hop is unreachable.");
-            break;
+            if has_go_mode {
+                if ttl >= args.go.unwrap() {
+                    println!("Ending path tracing because a hop was unreachable and the number of hops is over the go parameter.");
+                    break;
+                } else {
+                    println!("Warning: A hop is unreachable, but go mode is enabled -- overriding.")
+                }
+            } else {
+                println!("Ending path tracing because hop is unreachable.");
+                break;
+            }
         }
 
         if path_divergence_detected {
-            println!("Ending path tracing because divergence is detected.");
-            break;
+            if !args.permissive {
+                println!("Ending path tracing because divergence is detected.");
+                break;
+            }
+            if args.debug > 1 {
+                println!("Warning: Path divergence detected but permissive mode is enabled -- overriding.");
+                path_divergence_detected = false;
+            }
         }
 
         if encapsulation_error {
@@ -722,12 +738,17 @@ fn main() {
         // We know that new_hop can be added to the path.
         if let Some(new_hop) = new_hop {
             path.update_hop(ttl, &new_hop);
+            if new_hop.address == target {
+                println!("Target reached!");
+                break;
+            }
         } else {
             eprintln!(
                 "Error: The {}th hop was alive but no hop information was collected.",
                 ttl
             );
         }
+
 
         if probe_count == u8::MAX {
             println!("Max probes reached ... quitting.");
