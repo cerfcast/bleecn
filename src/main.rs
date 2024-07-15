@@ -118,8 +118,15 @@ fn main() {
         Target::Ipv6(addr) => bleecn::Target::Ipv6(addr),
     };
     let decorator = slog_term::PlainSyncDecorator::new(std::io::stdout());
-    let drain = slog_term::FullFormat::new(decorator).build().fuse();
+    let drain = slog_term::FullFormat::new(decorator).build().filter_level(
+        if args.debug > 0 {
+            slog::Level::Info
+        } else {
+            slog::Level::Warning
+        }
+    ).fuse();
     let logger = slog::Logger::root(drain, slog::o!("version" => "0.5"));
+
     let test_result = bleecn::bleecn(
         target,
         args.probe_count,
@@ -136,7 +143,7 @@ fn main() {
 
     let test_result = test_result.unwrap();
 
-    if args.debug > 1 || args.path {
+    if args.debug > 0 || args.path {
         println!("path: {}", test_result.path);
     }
     if let Some(bleeched_hop) = test_result.bleeched_hop.clone() {

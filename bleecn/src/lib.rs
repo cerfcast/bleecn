@@ -139,7 +139,7 @@ enum Mode {
 }
 
 #[derive(Serialize)]
-pub struct BleecnResult {
+pub struct TestResult {
     pub target: IpAddr,
     #[serde(flatten)]
     pub path: Path,
@@ -270,7 +270,7 @@ pub fn bleecn(
     hop_timeouts: u32,
     permissive: bool,
     log: &slog::Logger,
-) -> Result<BleecnResult, Box<dyn std::error::Error>> {
+) -> Result<TestResult, Box<dyn std::error::Error>> {
     //let mut path: HashMap<u8, Hop> = HashMap::new();
     let mut path = Path::new();
 
@@ -689,7 +689,7 @@ pub fn bleecn(
         info!(log, "Moving to the {}th hop\n", ttl);
     }
     let bleeched_hop = path.bleeched_hop();
-    Ok(BleecnResult {
+    Ok(TestResult {
         target,
         path,
         bleeched_hop,
