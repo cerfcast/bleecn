@@ -1,4 +1,0 @@
-[submodule "libpnet"]
-	path = libpnet
-	url = git@github.com:hawkinsw/libpnet.git
-	branch = path_mtu_discovery

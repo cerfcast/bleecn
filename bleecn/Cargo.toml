@@ -1,0 +1,12 @@
+[package]
+name = "bleecn"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = "4.5.9"
+pnet = {path = "libpnet"}
+rand = "0.8.5"
+serde = "1.0.204"
+serde_json = "1.0.120"
+slog = "2.7.0"

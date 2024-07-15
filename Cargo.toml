@@ -5,13 +5,12 @@ edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
-[workspace]
-members = ["libpnet"]
-
 [dependencies]
 clap = { version = "4.5.4", features = ["derive"] }
-pnet = { path = "libpnet" }
 rand = "0.8.5"
 reqwest = { version = "0.12.4", features = ["blocking", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+bleecn = { path = "bleecn" }
+slog = "2.7.0"
+slog-term = "2.9.1"
