@@ -118,13 +118,14 @@ fn main() {
         Target::Ipv6(addr) => bleecn::Target::Ipv6(addr),
     };
     let decorator = slog_term::PlainSyncDecorator::new(std::io::stdout());
-    let drain = slog_term::FullFormat::new(decorator).build().filter_level(
-        if args.debug > 0 {
+    let drain = slog_term::FullFormat::new(decorator)
+        .build()
+        .filter_level(if args.debug > 0 {
             slog::Level::Info
         } else {
             slog::Level::Warning
-        }
-    ).fuse();
+        })
+        .fuse();
     let logger = slog::Logger::root(drain, slog::o!("version" => "0.5"));
 
     let test_result = bleecn::bleecn(
