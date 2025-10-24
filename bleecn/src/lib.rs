@@ -342,7 +342,7 @@ pub fn bleecn(
 
     let baseline_dest_port = 33434u16;
     let baseline_src_port = 54321u16;
-
+/*
     if let Err(err) = tx.configure_path_mtu_discovery(false) {
         error!(
             log,
@@ -351,7 +351,7 @@ pub fn bleecn(
         );
         return Err(err.into());
     }
-
+*/
     loop {
         // Probe another hop.
 
