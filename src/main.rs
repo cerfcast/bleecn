@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use slog::Drain;
 
@@ -26,6 +26,12 @@ fn parse_target(arg: &str) -> Result<Target, String> {
     }
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+enum PathFormat {
+    Json,
+    Raw,
+}
+
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Cli {
@@ -36,9 +42,9 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
     debug: u8,
 
-    /// Print the discovered path.
-    #[arg(short, long, default_value_t = false)]
-    path: bool,
+    /// Dump the discovered path. Using this option precludes bleecn from listing simple bleaching assessment.
+    #[arg(long, value_enum)]
+    dump: Option<PathFormat>,
 
     /// Maximum number of consecutive timeouts before considering a hop unreachable.
     #[arg(long, default_value_t = 3)]
@@ -138,13 +144,27 @@ fn main() {
 
     let test_result = test_result.unwrap();
 
-    if args.debug > 0 || args.path {
-        println!("path: {}", test_result.path);
-    }
-    if let Some(bleeched_hop) = test_result.bleeched_hop.clone() {
-        println!("bleeching hop: {:?}", bleeched_hop);
+    // If the user asked for JSON output, we assume that they want the output
+    // all the time. And, that's the only output that they will get.
+    if let Some(dump) = args.dump {
+        match dump {
+            PathFormat::Json => {
+                let json_test_result = serde_json::to_string(&test_result).unwrap();
+                println!("{}", json_test_result);
+            }
+            PathFormat::Raw => {
+                println!("path: {}", test_result.path);
+            }
+        }
     } else {
-        println!("No ECN bleeching detected.");
+        if args.debug > 0 {
+            println!("path: {}", test_result.path);
+        }
+        if let Some(bleeched_hop) = test_result.bleeched_hop.clone() {
+            println!("bleeching hop: {:?}", bleeched_hop);
+        } else {
+            println!("No ECN bleeching detected.");
+        }
     }
 
     if let Some(publish_url) = args.publish {
