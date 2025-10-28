@@ -18,7 +18,7 @@ use pnet::transport::{
     icmp_packet_iter, icmpv6_packet_iter, Ecn, IcmpTransportChannelIterator,
     Icmpv6TransportChannelIterator,
 };
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::Serialize;
 use slog::{error, info};
 
 #[derive(Debug, Clone)]
@@ -45,32 +45,6 @@ impl Hop {
     fn merge(&mut self, other: &Hop) -> bool {
         self.detected_bleeching |= other.detected_bleeching;
         self.address == other.address
-    }
-}
-
-#[derive(Clone)]
-struct EcnWrapper {
-    pub ecn: Ecn,
-}
-
-impl Serialize for EcnWrapper {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let actual_value = self.ecn as u8;
-        serializer.serialize_u8(actual_value)
-    }
-}
-
-impl<'de> Deserialize<'de> for EcnWrapper {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let raw = u8::deserialize(deserializer)?;
-        let ecn = Ecn::from(raw);
-        Ok(EcnWrapper { ecn })
     }
 }
 
