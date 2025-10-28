@@ -9,15 +9,20 @@ enum Target {
     Ipv6(Ipv6Addr),
     Ipv4(Ipv4Addr),
     Name(String),
+    Random,
 }
 
 fn parse_target(arg: &str) -> Result<Target, String> {
-    match arg.parse() {
-        Ok(addr) => match addr {
-            IpAddr::V4(addr) => Ok(Target::Ipv4(addr)),
-            IpAddr::V6(addr) => Ok(Target::Ipv6(addr)),
-        },
-        Err(_) => Ok(Target::Name(arg.to_string())),
+    if arg == "_" {
+        Ok(Target::Random)
+    } else {
+        match arg.parse() {
+            Ok(addr) => match addr {
+                IpAddr::V4(addr) => Ok(Target::Ipv4(addr)),
+                IpAddr::V6(addr) => Ok(Target::Ipv6(addr)),
+            },
+            Err(_) => Ok(Target::Name(arg.to_string())),
+        }
     }
 }
 
@@ -25,8 +30,8 @@ fn parse_target(arg: &str) -> Result<Target, String> {
 #[command(version, about)]
 struct Cli {
     /// Where to send IP packets.
-    #[arg(short, value_parser = parse_target)]
-    target: Option<Target>,
+    #[arg(value_parser = parse_target)]
+    target: Target,
 
     #[arg(short, long, action = clap::ArgAction::Count)]
     debug: u8,
@@ -56,13 +61,13 @@ struct Cli {
     go: Option<u8>,
 }
 
-fn random_ip() -> String {
+fn random_ip() -> bleecn::Target {
     let a = rand::random::<u8>() % 255;
     let b = rand::random::<u8>() % 255;
     let c = rand::random::<u8>() % 255;
     let d = rand::random::<u8>() % 255;
 
-    format!("{}.{}.{}.{}", a, b, c, d).to_string()
+    bleecn::Target::Ipv4(Ipv4Addr::new(a, b, c, d))
 }
 
 fn main() {
@@ -74,19 +79,8 @@ fn main() {
         println!("Enabling go mode.");
     }
 
-    let cli_target = match args.target {
-        Some(t) => t,
-        None => {
-            let parse_result = parse_target(&random_ip());
-            println!(
-                "Using a random IP as the target: {:?}",
-                parse_result.clone().unwrap()
-            );
-            parse_result.unwrap()
-        }
-    };
-
-    let target = match cli_target {
+    let target = match args.target {
+        Target::Random => random_ip(),
         Target::Name(name) => {
             let hostname_with_dummy_port = name.clone() + ":80";
 
